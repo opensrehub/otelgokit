@@ -1,0 +1,51 @@
+services:
+  app:
+    container_name: app
+    build:
+      context: .
+    networks:
+      - opentelemetry
+    ports:
+      - 3000:3000
+    depends_on:
+      otel-collector:
+        condition: service_started
+    environment:
+      - ENVIRONMENT=development
+      - SERVICE_NAME=example-service
+      - SERVICE_VERSION=1.0.0
+      - OTEL_RESOURCE_ATTRIBUTES=service.version=1.0.0
+      - OTEL_COLLECTOR_URL=otel-collector:4317
+      - OTEL_GO_X_DEPRECATED_RUNTIME_METRICS=true
+
+  otel-collector:
+    container_name: otel-collector
+    image: otel/opentelemetry-collector-contrib:0.149.0
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./docker/otel-collector/config.yaml:/etc/otel-collector-config.yaml
+    ports:
+      - "4317:4317" # OTLP gRPC receiver
+      - "4318:4318" # OTLP HTTP receiver
+    environment:
+      OTEL_COLLECTOR_HOST: "otel-collector"
+      OTEL_COLLECTOR_PORT_GRPC: "4317"
+      OTEL_COLLECTOR_PORT_HTTP: "4318"
+    depends_on:
+      - otel-tui
+    networks:
+      - opentelemetry
+
+  otel-tui:
+    container_name: otel-tui
+    image: ymtdzzz/otel-tui:latest
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./docker/oteltui/config.yaml:/root/.config/otel-tui/config.yml
+    networks:
+      - opentelemetry
+
+networks:
+  opentelemetry:
+    driver: bridge
