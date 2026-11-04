@@ -2,10 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"log/slog"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/opensrehub/otelgokit/cmd/examples/config"
 	"github.com/opensrehub/otelgokit/cmd/examples/handlers"
@@ -14,8 +19,12 @@ import (
 	"github.com/opensrehub/otelgokit/pkg/tracing"
 )
 
+const shutdownTimeout = 5 * time.Second
+
 func main() {
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	cfg := config.LoadConfig()
 
 	// Logging — initialize first so subsequent errors are also exported
@@ -23,21 +32,28 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to initialize logger: %v", err)
 	}
-	defer mustShutdown("logger", func() error { return logging.ShutdownLogger(ctx) })
 
 	// Tracing
 	_, tp, err := tracing.InitTracer(ctx, cfg.ServiceName, cfg.Environment, cfg.CollectorURL)
 	if err != nil {
 		log.Fatalf("Failed to initialize tracer: %v", err)
 	}
-	defer mustShutdown("tracer", func() error { return tp.Shutdown(ctx) })
 
 	// Metrics
 	meter, mp, err := metrics.InitMeter(ctx, cfg.ServiceName, cfg.Environment, cfg.CollectorURL)
 	if err != nil {
 		log.Fatalf("Failed to initialize meter: %v", err)
 	}
-	defer mustShutdown("meter", func() error { return mp.Shutdown(ctx) })
+
+	// Use a fresh, bounded context because ctx is canceled by the shutdown signal.
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+
+		mustShutdown("meter", func() error { return mp.Shutdown(shutdownCtx) })
+		mustShutdown("tracer", func() error { return tp.Shutdown(shutdownCtx) })
+		mustShutdown("logger", func() error { return logging.ShutdownLogger(shutdownCtx) })
+	}()
 
 	// Handlers
 	h, err := handlers.New(meter)
@@ -63,8 +79,31 @@ func main() {
 		slog.String("addr", addr),
 	)
 
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		log.Fatalf("server: %v", err)
+	server := &http.Server{
+		Addr:    addr,
+		Handler: mux,
+	}
+
+	serverErrors := make(chan error, 1)
+	go func() {
+		serverErrors <- server.ListenAndServe()
+	}()
+
+	select {
+	case err := <-serverErrors:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("server: %v", err)
+		}
+		return
+	case <-ctx.Done():
+		logging.LogInfo(context.Background(), "server shutting down")
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Printf("shutdown server: %v", err)
 	}
 }
 
