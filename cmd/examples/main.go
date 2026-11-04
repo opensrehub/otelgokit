@@ -22,6 +22,12 @@ import (
 const shutdownTimeout = 5 * time.Second
 
 func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -30,19 +36,19 @@ func main() {
 	// Logging — initialize first so subsequent errors are also exported
 	_, err := logging.InitLogger(ctx, cfg.ServiceName, cfg.Environment, cfg.CollectorURL)
 	if err != nil {
-		log.Fatalf("Failed to initialize logger: %v", err)
+		return fmt.Errorf("initialize logger: %w", err)
 	}
 
 	// Tracing
 	_, tp, err := tracing.InitTracer(ctx, cfg.ServiceName, cfg.Environment, cfg.CollectorURL)
 	if err != nil {
-		log.Fatalf("Failed to initialize tracer: %v", err)
+		return fmt.Errorf("initialize tracer: %w", err)
 	}
 
 	// Metrics
 	meter, mp, err := metrics.InitMeter(ctx, cfg.ServiceName, cfg.Environment, cfg.CollectorURL)
 	if err != nil {
-		log.Fatalf("Failed to initialize meter: %v", err)
+		return fmt.Errorf("initialize meter: %w", err)
 	}
 
 	// Use a fresh, bounded context because ctx is canceled by the shutdown signal.
@@ -58,7 +64,7 @@ func main() {
 	// Handlers
 	h, err := handlers.New(meter)
 	if err != nil {
-		log.Fatalf("Failed to initialize handlers: %v", err)
+		return fmt.Errorf("initialize handlers: %w", err)
 	}
 
 	// Routes:
@@ -92,9 +98,9 @@ func main() {
 	select {
 	case err := <-serverErrors:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("server: %v", err)
+			return fmt.Errorf("serve: %w", err)
 		}
-		return
+		return nil
 	case <-ctx.Done():
 		logging.LogInfo(context.Background(), "server shutting down")
 	}
@@ -103,8 +109,10 @@ func main() {
 	defer cancel()
 
 	if err := server.Shutdown(shutdownCtx); err != nil {
-		log.Printf("shutdown server: %v", err)
+		return fmt.Errorf("shutdown server: %w", err)
 	}
+
+	return nil
 }
 
 // mustShutdown calls fn on defer and logs any error rather than panicking,
