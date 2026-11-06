@@ -2,10 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"log/slog"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/opensrehub/otelgokit/cmd/examples/config"
 	"github.com/opensrehub/otelgokit/cmd/examples/handlers"
@@ -14,35 +19,61 @@ import (
 	"github.com/opensrehub/otelgokit/pkg/tracing"
 )
 
+const shutdownTimeout = 5 * time.Second
+
 func main() {
-	ctx := context.Background()
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	cfg := config.LoadConfig()
 
-	// Logging — initialize first so subsequent errors are also exported
+	// Logging — initialize first so subsequent errors are also exported.
 	_, err := logging.InitLogger(ctx, cfg.ServiceName, cfg.Environment, cfg.CollectorURL)
 	if err != nil {
-		log.Fatalf("Failed to initialize logger: %v", err)
+		return fmt.Errorf("initialize logger: %w", err)
 	}
-	defer mustShutdown("logger", func() error { return logging.ShutdownLogger(ctx) })
+	// Give each provider its own shutdown timeout so a slow provider
+	// does not consume the remaining providers' flush budget.
+	defer func() {
+		sdCtx, c := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer c()
+		mustShutdown("logger", func() error { return logging.ShutdownLogger(sdCtx) })
+	}()
 
 	// Tracing
 	_, tp, err := tracing.InitTracer(ctx, cfg.ServiceName, cfg.Environment, cfg.CollectorURL)
 	if err != nil {
-		log.Fatalf("Failed to initialize tracer: %v", err)
+		logging.LogError(ctx, "failed to initialize tracer", slog.Any("error", err))
+		return fmt.Errorf("initialize tracer: %w", err)
 	}
-	defer mustShutdown("tracer", func() error { return tp.Shutdown(ctx) })
+	defer func() {
+		sdCtx, c := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer c()
+		mustShutdown("tracer", func() error { return tp.Shutdown(sdCtx) })
+	}()
 
 	// Metrics
 	meter, mp, err := metrics.InitMeter(ctx, cfg.ServiceName, cfg.Environment, cfg.CollectorURL)
 	if err != nil {
-		log.Fatalf("Failed to initialize meter: %v", err)
+		logging.LogError(ctx, "failed to initialize meter", slog.Any("error", err))
+		return fmt.Errorf("initialize meter: %w", err)
 	}
-	defer mustShutdown("meter", func() error { return mp.Shutdown(ctx) })
+	defer func() {
+		sdCtx, c := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer c()
+		mustShutdown("meter", func() error { return mp.Shutdown(sdCtx) })
+	}()
 
 	// Handlers
 	h, err := handlers.New(meter)
 	if err != nil {
-		log.Fatalf("Failed to initialize handlers: %v", err)
+		return fmt.Errorf("initialize handlers: %w", err)
 	}
 
 	// Routes:
@@ -63,9 +94,34 @@ func main() {
 		slog.String("addr", addr),
 	)
 
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		log.Fatalf("server: %v", err)
+	server := &http.Server{
+		Addr:    addr,
+		Handler: mux,
 	}
+
+	serverErrors := make(chan error, 1)
+	go func() {
+		serverErrors <- server.ListenAndServe()
+	}()
+
+	select {
+	case err := <-serverErrors:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("serve: %w", err)
+		}
+		return nil
+	case <-ctx.Done():
+		logging.LogInfo(context.Background(), "server shutting down")
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		return fmt.Errorf("shutdown server: %w", err)
+	}
+
+	return nil
 }
 
 // mustShutdown calls fn on defer and logs any error rather than panicking,
