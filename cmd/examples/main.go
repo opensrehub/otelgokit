@@ -33,32 +33,41 @@ func run() error {
 
 	cfg := config.LoadConfig()
 
-	// Logging — initialize first so subsequent errors are also exported
+	// Logging — initialize first so subsequent errors are also exported.
 	_, err := logging.InitLogger(ctx, cfg.ServiceName, cfg.Environment, cfg.CollectorURL)
 	if err != nil {
 		return fmt.Errorf("initialize logger: %w", err)
 	}
+	// Give each provider its own shutdown timeout so a slow provider
+	// does not consume the remaining providers' flush budget.
+	defer func() {
+		sdCtx, c := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer c()
+		mustShutdown("logger", func() error { return logging.ShutdownLogger(sdCtx) })
+	}()
 
 	// Tracing
 	_, tp, err := tracing.InitTracer(ctx, cfg.ServiceName, cfg.Environment, cfg.CollectorURL)
 	if err != nil {
+		logging.LogError(ctx, "failed to initialize tracer", slog.Any("error", err))
 		return fmt.Errorf("initialize tracer: %w", err)
 	}
+	defer func() {
+		sdCtx, c := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer c()
+		mustShutdown("tracer", func() error { return tp.Shutdown(sdCtx) })
+	}()
 
 	// Metrics
 	meter, mp, err := metrics.InitMeter(ctx, cfg.ServiceName, cfg.Environment, cfg.CollectorURL)
 	if err != nil {
+		logging.LogError(ctx, "failed to initialize meter", slog.Any("error", err))
 		return fmt.Errorf("initialize meter: %w", err)
 	}
-
-	// Use a fresh, bounded context because ctx is canceled by the shutdown signal.
 	defer func() {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-		defer cancel()
-
-		mustShutdown("meter", func() error { return mp.Shutdown(shutdownCtx) })
-		mustShutdown("tracer", func() error { return tp.Shutdown(shutdownCtx) })
-		mustShutdown("logger", func() error { return logging.ShutdownLogger(shutdownCtx) })
+		sdCtx, c := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer c()
+		mustShutdown("meter", func() error { return mp.Shutdown(sdCtx) })
 	}()
 
 	// Handlers
